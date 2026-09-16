@@ -1,0 +1,11 @@
+﻿services:
+  - type: web
+    name: bilgi-agaci-api
+    env: node
+    plan: free
+    region: frankfurt
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
