@@ -179,6 +179,19 @@ export class GeminiService {
   }
 
   /**
+   * Ham markdown yıldızlarını (**kalın**, *italik*) ve bozuk liste işaretlerini temizler
+   */
+  private static cleanMarkdown(text?: string | null): string {
+    if (!text) return "";
+    return text
+      .replace(/\*\*([^*]+?)\*\*/g, "$1")
+      .replace(/\*([^*]+?)\*/g, "$1")
+      .replace(/^(\*|-)\s+/gm, "• ")
+      .replace(/\*\*/g, "")
+      .trim();
+  }
+
+  /**
    * Gemini'den gelen JSON verisini Zod şemasıyla %100 uyumlu hale getirmek için normalize eder
    */
   private static normalizeAnalysisResponse(parsedJson: any): any {
@@ -188,6 +201,34 @@ export class GeminiService {
 
     if (!parsedJson.identification || typeof parsedJson.identification !== "object") {
       parsedJson.identification = { name: "Tanımlanamayan Nesne" };
+    }
+
+    // 1. İsim, Açıklama ve Güvenlik Uyarılarının Markdown Temizliği
+    if (parsedJson.identification.name) {
+      parsedJson.identification.name = this.cleanMarkdown(parsedJson.identification.name);
+    }
+    if (parsedJson.identification.confidenceNote) {
+      parsedJson.identification.confidenceNote = this.cleanMarkdown(parsedJson.identification.confidenceNote);
+    }
+    if (parsedJson.identification.safetyWarning) {
+      parsedJson.identification.safetyWarning = this.cleanMarkdown(parsedJson.identification.safetyWarning);
+    }
+    if (parsedJson.shortDescription) {
+      parsedJson.shortDescription = this.cleanMarkdown(parsedJson.shortDescription);
+    }
+
+    // 2. Google Play Politikası / Veterinerlik & Tıbbi terim normalizasyonu
+    if (parsedJson.identification?.category) {
+      const catLower = String(parsedJson.identification.category).toLowerCase().trim();
+      if (catLower.includes("veteriner")) {
+        if (catLower.includes("evcil") || catLower.includes("kedi") || catLower.includes("köpek") || catLower.includes("kuş") || catLower.includes("pet")) {
+          parsedJson.identification.category = "Evcil Hayvan Rehberi";
+        } else {
+          parsedJson.identification.category = "Doğa Rehberi";
+        }
+      } else if (catLower.includes("tıbbi") || catLower.includes("tedavi") || catLower.includes("reçete") || catLower.includes("teşhis")) {
+        parsedJson.identification.category = "Doğa & Bilgi Rehberi";
+      }
     }
 
     // Sources normalizasyonu (string veya obje)
@@ -215,7 +256,7 @@ export class GeminiService {
     // Similar normalizasyonu
     if (Array.isArray(parsedJson.similarOrRelated)) {
       parsedJson.similarOrRelated = parsedJson.similarOrRelated.map((item: any) =>
-        typeof item === "string" ? item : String(item?.name || item?.title || item)
+        typeof item === "string" ? this.cleanMarkdown(item) : this.cleanMarkdown(String(item?.name || item?.title || item))
       );
     } else {
       parsedJson.similarOrRelated = [];
@@ -224,22 +265,85 @@ export class GeminiService {
     // Suggested questions normalizasyonu
     if (Array.isArray(parsedJson.suggestedQuestions)) {
       parsedJson.suggestedQuestions = parsedJson.suggestedQuestions.map((q: any) =>
-        typeof q === "string" ? q : String(q?.question || q?.text || q)
+        typeof q === "string" ? this.cleanMarkdown(q) : this.cleanMarkdown(String(q?.question || q?.text || q))
       );
     } else {
       parsedJson.suggestedQuestions = [];
     }
 
-    // Sections normalizasyonu
+    // 3. Sections normalizasyonu (Başlık, Markdown temizliği, Hap Bilgi ve Yasal Uyarı)
+    let hasHapBilgi = false;
+    let extractedHap = "";
+
     if (Array.isArray(parsedJson.sections)) {
       parsedJson.sections = parsedJson.sections.map((sec: any, idx: number) => {
         if (!sec || typeof sec !== "object") {
-          return { id: `sec_${idx}`, title: "Bilgi", type: "text", content: String(sec) };
+          return { id: `sec_${idx}`, title: "Bilgi", type: "text", content: this.cleanMarkdown(String(sec)) };
         }
-        return sec;
+        let title = sec.title || "Bilgi";
+        const tLower = title.toLowerCase().trim();
+        if (tLower.includes("tedavi") || tLower.includes("tıbbi müdahale")) {
+          title = "İlk Önlem / Öneri";
+        } else if (tLower.includes("ilaç") || tLower.includes("reçete")) {
+          title = "Bakım & Önlem Tavsiyeleri";
+        } else if (tLower.includes("veteriner")) {
+          title = "Uzman Görüşü / İlk Önlemler";
+        }
+
+        if (tLower.includes("hap bilgi")) {
+          hasHapBilgi = true;
+        }
+
+        const normalizedSec: any = { ...sec, title };
+
+        if (normalizedSec.content) {
+          normalizedSec.content = this.cleanMarkdown(normalizedSec.content);
+          if (!hasHapBilgi && !extractedHap && normalizedSec.content.length > 120) {
+            const sentenceMatch = normalizedSec.content.match(/^([^\.!?]+[\.!?])/);
+            if (sentenceMatch && sentenceMatch[1]) {
+              extractedHap = sentenceMatch[1].trim();
+            }
+          }
+        }
+
+        if (Array.isArray(normalizedSec.bulletPoints)) {
+          normalizedSec.bulletPoints = normalizedSec.bulletPoints.map((p: any) => this.cleanMarkdown(String(p)));
+        }
+
+        if (Array.isArray(normalizedSec.attributes)) {
+          normalizedSec.attributes = normalizedSec.attributes.map((attr: any) => ({
+            label: this.cleanMarkdown(attr?.label),
+            value: this.cleanMarkdown(attr?.value)
+          }));
+        }
+
+        return normalizedSec;
       });
     } else {
       parsedJson.sections = [];
+    }
+
+    // Hap Bilgi kartını en başa yerleştir
+    if (!hasHapBilgi && extractedHap) {
+      parsedJson.sections.unshift({
+        id: "hap_bilgi",
+        title: "💡 Hap Bilgi",
+        type: "text",
+        content: extractedHap
+      });
+    }
+
+    // Google Play Politikası: Sabit Yasal Uyarı kartı ekle
+    const hasDisclaimer = parsedJson.sections.some((s: any) =>
+      s.content?.includes("kesin teşhis niteliği taşımaz") || s.title?.includes("Bilgilendirme Uyarısı")
+    );
+    if (!hasDisclaimer) {
+      parsedJson.sections.push({
+        id: "yasal_uyari",
+        title: "ℹ️ Bilgilendirme Uyarısı",
+        type: "text",
+        content: "Bu bilgiler genel bilgilendirme amaçlıdır, kesin teşhis niteliği taşımaz."
+      });
     }
 
     return parsedJson;
@@ -287,6 +391,7 @@ Görevin fotoğraftaki nesneyi, canlıyı, yapıyı, eseri veya ürünü tespit 
 5. İLGİNÇ BİLGİLER: 2-4 şaşırtıcı gerçek ekle.
 6. TAKİP SORULARI: 3 mantıklı devam sorusu öner ('suggestedQuestions').
 7. KAYNAKLAR: Güvenilir internet sitelerini ('sources') listele.
+8. POLİTİKA UYUMLULUĞU: Kategori ('category') olarak ASLA 'Veterinerlik' veya 'Tıbbi Teşhis' yazma. Hayvanlar için 'Evcil Hayvan Rehberi' veya 'Doğa Rehberi' kullan. Bölüm başlığı olarak ASLA 'Tedavi' veya 'Reçete' yazma; 'İlk Önlem / Öneri' veya 'Bakım & Tavsiyeler' kullan. Asla tıbbi reçete yazma.
 
 YANITINI SADECE VE SADECE AŞAĞIDAKİ JSON FORMATINDA DÖNDÜR (BAŞKA HİÇBİR AÇIKLAMA METNİ EKLEME):
 {
@@ -445,7 +550,8 @@ TALİMATLAR:
     });
 
     const candidate = response.candidates?.[0];
-    const answer = response.text || candidate?.content?.parts?.map((p: any) => p.text || "").join("").trim() || "Cevap üretilemedi.";
+    const answerRaw = response.text || candidate?.content?.parts?.map((p: any) => p.text || "").join("").trim() || "Cevap üretilemedi.";
+    const answer = this.cleanMarkdown(answerRaw);
     const sources = this.extractGroundingSources(response);
 
     return {
@@ -466,7 +572,8 @@ Görevin bu konu/nesne/kavram hakkında internetteki en güncel ve güvenilir ka
 
 Kurallar:
 - 'identification.name' kısmına sorgulanan şeyin tam adını yaz.
-- 'identification.category' (örn: Astrofizik, Tarih, Biyoloji, Teknoloji, vb.) belirle.
+- 'identification.category' (örn: Doğa Rehberi, Astrofizik, Tarih, Biyoloji, Teknoloji, vb.) belirle. ASLA 'Veterinerlik' veya 'Tıbbi Teşhis' yazma; hayvanlar için 'Evcil Hayvan Rehberi' veya 'Doğa Rehberi' kullan.
+- Bölüm başlıklarında ASLA 'Tedavi' veya 'Reçete' yazma, 'İlk Önlem / Öneri' veya 'Bakım Tavsiyeleri' kullan.
 - 'identification.confidenceLevel' genelde 'high' olmalı.
 - Yanıtı SADECE ve KESİNLİKLE aşağıdaki JSON şemasında döndür.
 
